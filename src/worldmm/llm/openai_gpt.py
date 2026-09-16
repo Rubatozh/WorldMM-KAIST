@@ -31,6 +31,66 @@ from tqdm.asyncio import tqdm as tqdm_asyncio
 from .utils import dynamic_retry_decorator
 
 # Configure logging
+# --- CHAT-COMPLETIONS FALLBACK (added for OpenAI-compatible servers) ---------
+#
+# This class talks the Responses API (`client.responses.create`, content parts
+# typed `input_text` / `input_image`). OpenAI serves it; most OpenAI-COMPATIBLE
+# servers do not, or serve only a text-only subset. vLLM 0.14 accepts a
+# structured text `input` but rejects any `input_image` part with
+#   400 "N validation errors ... ('body','input','str') Input should be a valid
+#        string"
+# which makes the captioner -- the one role that must send frames -- unusable
+# against a locally served model.
+#
+# So the same prompt can be sent over `/v1/chat/completions`, which every such
+# server implements. OFF by default: the Responses path is what the paper ran
+# and stays the default. Set WORLDMM_CHAT_COMPLETIONS=1 to switch.
+def _use_chat_completions() -> bool:
+    return os.environ.get("WORLDMM_CHAT_COMPLETIONS", "").strip() in ("1", "true", "yes")
+
+
+def _to_chat_messages(prompt):
+    """Responses-shaped `input` -> chat-completions `messages`.
+
+    Only the content-part spelling differs; roles and ordering are untouched:
+        input_text  {"text": ...}      -> text      {"text": ...}
+        input_image {"image_url": str} -> image_url {"image_url": {"url": str}}
+    A plain string prompt becomes a single user message.
+    """
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    messages = []
+    for msg in prompt:
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                kind = part.get("type")
+                if kind in ("input_text", "text"):
+                    parts.append({"type": "text", "text": part.get("text", "")})
+                elif kind in ("input_image", "image_url"):
+                    url = part.get("image_url")
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    parts.append({"type": "image_url",
+                                  "image_url": {"url": url}})
+                else:
+                    parts.append(part)
+            content = parts
+        messages.append({"role": msg.get("role", "user"), "content": content})
+    return messages
+
+
+def _chat_kwargs(kwargs):
+    """Responses kwargs that chat-completions spells differently or lacks."""
+    out = dict(kwargs)
+    if "max_output_tokens" in out:
+        out["max_tokens"] = out.pop("max_output_tokens")
+    for drop in ("text_format", "store", "reasoning", "truncation"):
+        out.pop(drop, None)
+    return out
+
+
 logger = logging.getLogger(__name__)
 # if not logger.handlers:
 #     handler = logging.StreamHandler()
@@ -642,13 +702,21 @@ class OpenAIModel:
                 return getattr(response, "output_parsed", None)
 
             # Default unstructured behavior
+            if _use_chat_completions():
+                chat = self.sync_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=_to_chat_messages(processed_prompt),
+                    **_chat_kwargs({**self.kwargs, **kwargs})
+                )
+                return (chat.choices[0].message.content or "").strip()
+
             response = self.sync_client.responses.create(
                 model=self.model_name,
                 input=processed_prompt,
                 **self.kwargs,
                 **kwargs
             )
-            
+
             return response.output_text.strip()
             
         except Exception as e:
@@ -698,6 +766,14 @@ class OpenAIModel:
                     **self.kwargs,
                 )
                 return getattr(response, "output_parsed", None)
+
+            if _use_chat_completions():
+                chat = await self.async_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=_to_chat_messages(prompt),
+                    **_chat_kwargs(self.kwargs)
+                )
+                return (chat.choices[0].message.content or "").strip()
 
             response = await self.async_client.responses.create(
                 model=self.model_name,
