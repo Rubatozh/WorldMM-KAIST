@@ -31,31 +31,17 @@ from tqdm.asyncio import tqdm as tqdm_asyncio
 from .utils import dynamic_retry_decorator
 
 # Configure logging
-# --- CHAT-COMPLETIONS FALLBACK (added for OpenAI-compatible servers) ---------
-#
-# This class talks the Responses API (`client.responses.create`, content parts
-# typed `input_text` / `input_image`). OpenAI serves it; most OpenAI-COMPATIBLE
-# servers do not, or serve only a text-only subset. vLLM 0.14 accepts a
-# structured text `input` but rejects any `input_image` part with
-#   400 "N validation errors ... ('body','input','str') Input should be a valid
-#        string"
-# which makes the captioner -- the one role that must send frames -- unusable
-# against a locally served model.
-#
-# So the same prompt can be sent over `/v1/chat/completions`, which every such
-# server implements. OFF by default: the Responses path is what the paper ran
-# and stays the default. Set WORLDMM_CHAT_COMPLETIONS=1 to switch.
+# Chat-completions fallback for OpenAI-compatible servers that don't support
+# the Responses API. Off by default; set WORLDMM_CHAT_COMPLETIONS=1 to enable.
 def _use_chat_completions() -> bool:
     return os.environ.get("WORLDMM_CHAT_COMPLETIONS", "").strip() in ("1", "true", "yes")
 
 
 def _to_chat_messages(prompt):
-    """Responses-shaped `input` -> chat-completions `messages`.
+    """Convert Responses-shaped `input` to chat-completions `messages`.
 
-    Only the content-part spelling differs; roles and ordering are untouched:
-        input_text  {"text": ...}      -> text      {"text": ...}
-        input_image {"image_url": str} -> image_url {"image_url": {"url": str}}
-    A plain string prompt becomes a single user message.
+    input_text/input_image content parts become text/image_url parts; a plain
+    string prompt becomes a single user message.
     """
     if isinstance(prompt, str):
         return [{"role": "user", "content": prompt}]
